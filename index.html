@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Livengood Light Map v2.54</title>
+<title>Livengood Light Map v2.55</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 64 64%22%3E%3Cpath d=%22M32 5C18 5 10 15 12 28c1 8 7 12 11 18h18c4-6 10-10 11-18C54 15 46 5 32 5Z%22 fill=%22%23e53935%22 stroke=%22%239b1c1c%22 stroke-width=%223%22/%3E%3Cpath d=%22M24 46h16v5H24zM26 52h12v4H26zM28 57h8v3h-8z%22 fill=%22%23b8b8b8%22 stroke=%22%23555%22/%3E%3Cellipse cx=%2223%22 cy=%2216%22 rx=%224%22 ry=%227%22 fill=%22%23ffffff%22 opacity=%22.65%22/%3E%3C/svg%3E">
 <style>
 :root{
@@ -484,7 +484,7 @@ select.cell-input{width:100%;text-align:right;padding:4px 5px;}
         </svg>
         <h1>Layout</h1>
       </div>
-      <span class="version-tag mono" id="versionTag">v2.54</span>
+      <span class="version-tag mono" id="versionTag">v2.55</span>
     </div>
     <div class="header-actions">
       <button class="btn btn-primary" id="btnSaveFile">Save layout</button>
@@ -3718,6 +3718,8 @@ function isValidLayoutShape(parsed){
   if(parsed.assumptions != null && (typeof parsed.assumptions !== "object" || Array.isArray(parsed.assumptions))) return false;
   return true;
 }
+window.livengoodCloudReadState = function(){ return JSON.parse(JSON.stringify(state)); };
+window.livengoodCloudApplyState = function(parsed){ applyLoadedState(parsed); };
 function applyLoadedState(parsed){
   state = normalizeState(parsed);
   placementUndo = [];
@@ -4017,7 +4019,7 @@ renderAll();
   showPage("layout");
 })();
 
-/* v2.54 Google Drive sync: browser OAuth token, app-owned file, optimistic version checks. */
+/* v2.55 Google Drive sync: browser OAuth token, app-owned file, optimistic version checks. */
 (function(){
   "use strict";
   var CLIENT_KEY="livengood-google-client-id-v1", META_KEY="livengood-drive-sync-meta-v1";
@@ -4026,7 +4028,7 @@ renderAll();
   var token="", tokenClient=null, fileId="", version="", lastSynced="", dirty=false, busy=false, timer=null, initialized=false, pendingCloud=false;
   var meta={}; try{meta=JSON.parse(localStorage.getItem(META_KEY)||"{}");}catch(e){}
   function setStatus(s){status.textContent="Drive: "+s;}
-  function snapshot(){return JSON.stringify(state);}
+  function snapshot(){return JSON.stringify(window.livengoodCloudReadState());}
   function remember(){try{localStorage.setItem(META_KEY,JSON.stringify({fileId:fileId,version:version,lastSynced:lastSynced}));}catch(e){}}
   function fail(e){setStatus(navigator.onLine===false?"offline — changes kept locally":"error — "+String(e.message||e).slice(0,95));}
   async function api(url,opts){
@@ -4065,7 +4067,7 @@ renderAll();
         var remoteState=await download(fileId),remoteJSON=JSON.stringify(remoteState),localJSON=snapshot();
         if(remoteJSON!==localJSON){
           var useCloud=confirm("A Google Drive layout already exists.\n\nOK = load the Drive layout on this device.\nCancel = keep this device's layout (do not overwrite Drive).\n\nYour JSON backup remains available.");
-          if(useCloud){applyLoadedState(remoteState);lastSynced=snapshot();dirty=false;}
+          if(useCloud){window.livengoodCloudApplyState(remoteState);lastSynced=snapshot();dirty=false;}
           else {lastSynced=remoteJSON;dirty=true;setStatus("local changes pending — choose Save to Google Drive");}
         }else{lastSynced=localJSON;dirty=false;}
       }
@@ -4083,12 +4085,12 @@ renderAll();
       if(String(current.version)!==String(version)){
         var cloudState=await download(fileId), cloudJSON=JSON.stringify(cloudState);
         if(cloudJSON===before){version=String(current.version);lastSynced=before;dirty=false;remember();setStatus("synced");return;}
-        if(before===lastSynced){applyLoadedState(cloudState);version=String(current.version);lastSynced=snapshot();dirty=false;remember();setStatus("updated from Drive");return;}
+        if(before===lastSynced){window.livengoodCloudApplyState(cloudState);version=String(current.version);lastSynced=snapshot();dirty=false;remember();setStatus("updated from Drive");return;}
         setStatus("CONFLICT — both devices changed");
         if(confirm("Google Drive has newer changes AND this device has unsynced changes.\n\nOK = load the Drive copy (local changes remain in your browser backup until replaced).\nCancel = keep this device's changes without uploading.\n\nFor safety, export Save layout before choosing OK.")){
           // Require a second confirmation before discarding locally edited state.
           if(confirm("Have you exported a JSON backup of this device's changes? Load Drive now?")){
-            applyLoadedState(cloudState);version=String(current.version);lastSynced=snapshot();dirty=false;remember();setStatus("updated from Drive");
+            window.livengoodCloudApplyState(cloudState);version=String(current.version);lastSynced=snapshot();dirty=false;remember();setStatus("updated from Drive");
           }
         }
         return;
