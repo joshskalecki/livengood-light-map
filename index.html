@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Livengood Light Map v2.53</title>
+<title>Livengood Light Map v2.54</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 64 64%22%3E%3Cpath d=%22M32 5C18 5 10 15 12 28c1 8 7 12 11 18h18c4-6 10-10 11-18C54 15 46 5 32 5Z%22 fill=%22%23e53935%22 stroke=%22%239b1c1c%22 stroke-width=%223%22/%3E%3Cpath d=%22M24 46h16v5H24zM26 52h12v4H26zM28 57h8v3h-8z%22 fill=%22%23b8b8b8%22 stroke=%22%23555%22/%3E%3Cellipse cx=%2223%22 cy=%2216%22 rx=%224%22 ry=%227%22 fill=%22%23ffffff%22 opacity=%22.65%22/%3E%3C/svg%3E">
 <style>
 :root{
@@ -484,11 +484,14 @@ select.cell-input{width:100%;text-align:right;padding:4px 5px;}
         </svg>
         <h1>Layout</h1>
       </div>
-      <span class="version-tag mono" id="versionTag">v2.53</span>
+      <span class="version-tag mono" id="versionTag">v2.54</span>
     </div>
     <div class="header-actions">
       <button class="btn btn-primary" id="btnSaveFile">Save layout</button>
       <button class="btn" id="btnOpenFile">Open layout&hellip;</button>
+      <button class="btn" id="cloudConnect">Connect Google Drive</button>
+      <button class="btn" id="cloudSave" disabled>Save to Google Drive</button>
+      <span id="cloudStatus" role="status" aria-live="polite" style="font-size:12px;max-width:280px">Drive: not connected</span>
       <input type="file" id="fileOpenInput" accept="application/json,.json" style="display:none">
     </div>
   </header>
@@ -1139,6 +1142,7 @@ function loadState(){
 }
 function saveState(){
   try{ window.localStorage.setItem(STORAGE_KEY, JSON.stringify(state)); }catch(e){ /* storage unavailable: continue without persistence */ }
+  if(window.livengoodCloudChanged) window.livengoodCloudChanged();
 }
 
 var mode = {type:"idle"};
@@ -4012,6 +4016,110 @@ renderAll();
   settingsTab.addEventListener("click",function(){showPage("settings");});
   showPage("layout");
 })();
+
+/* v2.54 Google Drive sync: browser OAuth token, app-owned file, optimistic version checks. */
+(function(){
+  "use strict";
+  var CLIENT_KEY="livengood-google-client-id-v1", META_KEY="livengood-drive-sync-meta-v1";
+  var FILE_NAME="livengood-light-map-layout.json";
+  var connect=document.getElementById("cloudConnect"), save=document.getElementById("cloudSave"), status=document.getElementById("cloudStatus");
+  var token="", tokenClient=null, fileId="", version="", lastSynced="", dirty=false, busy=false, timer=null, initialized=false, pendingCloud=false;
+  var meta={}; try{meta=JSON.parse(localStorage.getItem(META_KEY)||"{}");}catch(e){}
+  function setStatus(s){status.textContent="Drive: "+s;}
+  function snapshot(){return JSON.stringify(state);}
+  function remember(){try{localStorage.setItem(META_KEY,JSON.stringify({fileId:fileId,version:version,lastSynced:lastSynced}));}catch(e){}}
+  function fail(e){setStatus(navigator.onLine===false?"offline — changes kept locally":"error — "+String(e.message||e).slice(0,95));}
+  async function api(url,opts){
+    opts=opts||{};opts.headers=Object.assign({Authorization:"Bearer "+token},opts.headers||{});
+    var r=await fetch(url,opts);
+    if(r.status===401){token="";save.disabled=true;setStatus("sign in again");throw Error("Google sign-in expired");}
+    if(!r.ok){var t=await r.text();throw Error("Google Drive HTTP "+r.status+" "+t.slice(0,130));}
+    return r;
+  }
+  function q(s){return encodeURIComponent(s);}
+  async function findFile(){
+    var url="https://www.googleapis.com/drive/v3/files?q="+q("name = '"+FILE_NAME+"' and trashed = false")+"&fields="+q("nextPageToken,files(id,name,version,modifiedTime)")+"&page_size=100";
+    var data=await (await api(url)).json();
+    var files=data.files||[];files.sort(function(a,b){return String(b.modifiedTime).localeCompare(String(a.modifiedTime));});
+    return files[0]||null;
+  }
+  async function info(id){return (await (await api("https://www.googleapis.com/drive/v3/files/"+q(id)+"?fields=id,name,version,modifiedTime")).json());}
+  async function download(id){var obj=await (await api("https://www.googleapis.com/drive/v3/files/"+q(id)+"?alt=media")).json();if(!isValidLayoutShape(obj))throw Error("Cloud layout is not valid");return obj;}
+  async function uploadNew(){
+    var boundary="livengood"+Date.now();
+    var body="--"+boundary+"\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n"+JSON.stringify({name:FILE_NAME,mimeType:"application/json"})+"\r\n--"+boundary+"\r\nContent-Type: application/json\r\n\r\n"+snapshot()+"\r\n--"+boundary+"--";
+    var r=await api("https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,version",{method:"POST",headers:{"Content-Type":"multipart/related; boundary="+boundary},body:body});return r.json();
+  }
+  async function uploadExisting(id){
+    var r=await api("https://www.googleapis.com/upload/drive/v3/files/"+q(id)+"?uploadType=media&fields=id,version",{method:"PATCH",headers:{"Content-Type":"application/json"},body:snapshot()});return r.json();
+  }
+  async function initialize(){
+    busy=true;setStatus("checking cloud layout");
+    try{
+      var remote=await findFile();
+      if(!remote){
+        if(!confirm("No existing Livengood cloud layout was found. Create one from the layout currently shown?")){setStatus("connected — cloud setup pending");return;}
+        var created=await uploadNew();fileId=created.id;version=String(created.version||"");lastSynced=snapshot();dirty=false;
+      }else{
+        fileId=remote.id;version=String(remote.version||"");
+        var remoteState=await download(fileId),remoteJSON=JSON.stringify(remoteState),localJSON=snapshot();
+        if(remoteJSON!==localJSON){
+          var useCloud=confirm("A Google Drive layout already exists.\n\nOK = load the Drive layout on this device.\nCancel = keep this device's layout (do not overwrite Drive).\n\nYour JSON backup remains available.");
+          if(useCloud){applyLoadedState(remoteState);lastSynced=snapshot();dirty=false;}
+          else {lastSynced=remoteJSON;dirty=true;setStatus("local changes pending — choose Save to Google Drive");}
+        }else{lastSynced=localJSON;dirty=false;}
+      }
+      initialized=true;remember();save.disabled=false;setStatus(dirty?"local changes pending":"synced");
+    }catch(e){fail(e);}finally{busy=false;}
+  }
+  async function sync(manual){
+    if(!token||!initialized||busy)return;
+    if(!navigator.onLine){setStatus("offline — changes kept locally");return;}
+    if(!dirty && !manual)return;
+    busy=true;setStatus("syncing");
+    try{
+      var before=snapshot();
+      var current=await info(fileId);
+      if(String(current.version)!==String(version)){
+        var cloudState=await download(fileId), cloudJSON=JSON.stringify(cloudState);
+        if(cloudJSON===before){version=String(current.version);lastSynced=before;dirty=false;remember();setStatus("synced");return;}
+        if(before===lastSynced){applyLoadedState(cloudState);version=String(current.version);lastSynced=snapshot();dirty=false;remember();setStatus("updated from Drive");return;}
+        setStatus("CONFLICT — both devices changed");
+        if(confirm("Google Drive has newer changes AND this device has unsynced changes.\n\nOK = load the Drive copy (local changes remain in your browser backup until replaced).\nCancel = keep this device's changes without uploading.\n\nFor safety, export Save layout before choosing OK.")){
+          // Require a second confirmation before discarding locally edited state.
+          if(confirm("Have you exported a JSON backup of this device's changes? Load Drive now?")){
+            applyLoadedState(cloudState);version=String(current.version);lastSynced=snapshot();dirty=false;remember();setStatus("updated from Drive");
+          }
+        }
+        return;
+      }
+      if(before===lastSynced){dirty=false;setStatus("synced");return;}
+      var result=await uploadExisting(fileId);
+      version=String(result.version||"");lastSynced=before;dirty=snapshot()!==before;remember();setStatus(dirty?"new edits pending":"synced");
+      if(dirty)queue();
+    }catch(e){fail(e);}finally{busy=false;}
+  }
+  function queue(){if(timer)clearTimeout(timer);timer=setTimeout(function(){sync(false);},1700);}
+  window.livengoodCloudChanged=function(){if(!initialized)return;dirty=snapshot()!==lastSynced;if(dirty){setStatus(token?"local changes — waiting to sync":"offline — changes kept locally");if(token)queue();}};
+  function startGoogle(){
+    if(!window.google||!google.accounts||!google.accounts.oauth2){setStatus("Google sign-in unavailable — check connection");return;}
+    var clientId=localStorage.getItem(CLIENT_KEY)||"";
+    if(!clientId){clientId=prompt("Paste your Google OAuth Web Client ID (ends in .apps.googleusercontent.com). Never enter a client secret:","")||"";clientId=clientId.trim();if(!clientId)return;
+      if(!/^[a-zA-Z0-9._-]+\.apps\.googleusercontent\.com$/.test(clientId)){alert("That does not look like a Google OAuth Client ID.");return;}
+      localStorage.setItem(CLIENT_KEY,clientId);
+    }
+    tokenClient=google.accounts.oauth2.initTokenClient({client_id:clientId,scope:"https://www.googleapis.com/auth/drive.file",callback:function(r){if(r.error||!r.access_token){fail(Error(r.error||"Google sign-in failed"));return;}token=r.access_token;connect.textContent="Reconnect Google Drive";initialize();}});
+    tokenClient.requestAccessToken({prompt:"consent"});
+  }
+  connect.addEventListener("click",function(){if(token){if(confirm("Reconnect Google Drive? Click Cancel to change your OAuth Client ID.")){initialize();return;}localStorage.removeItem(CLIENT_KEY);}startGoogle();});
+  save.addEventListener("click",function(){dirty=snapshot()!==lastSynced;sync(true);});
+  window.addEventListener("online",function(){if(token){setStatus("back online — checking changes");queue();}});
+  window.addEventListener("offline",function(){setStatus("offline — changes kept locally");});
+  document.addEventListener("visibilitychange",function(){if(!document.hidden&&token&&initialized){dirty=snapshot()!==lastSynced;sync(true);}});
+  setStatus("not connected — local saves active");
+})();
+
 </script>
+<script src="https://accounts.google.com/gsi/client" async defer></script>
 
 </html>
